@@ -21,21 +21,19 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.slice.Slice;
 import io.airlift.units.Duration;
+import org.apache.http.HttpHost;
 import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.search.SearchHit;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
 
 import static com.facebook.airlift.json.JsonCodec.jsonCodec;
+import static com.facebook.presto.elasticsearch.ElasticsearchErrorCode.ELASTICSEARCH_CONNECTION_ERROR;
 import static com.facebook.presto.elasticsearch.ElasticsearchErrorCode.ELASTICSEARCH_MAX_HITS_EXCEEDED;
 import static com.facebook.presto.elasticsearch.ElasticsearchUtils.serializeObject;
 import static com.facebook.presto.elasticsearch.RetryDriver.retry;
@@ -64,6 +62,8 @@ public class ElasticsearchRecordCursor
     private final int maxAttempts;
     private final Duration maxRetryTime;
     private final ElasticsearchQueryBuilder builder;
+    private final RestHighLevelClient client;
+
 
     private long totalBytes;
     private List<Object> fields;
@@ -78,6 +78,17 @@ public class ElasticsearchRecordCursor
         this.requestTimeout = config.getRequestTimeout();
         this.maxAttempts = config.getMaxRequestRetries();
         this.maxRetryTime = config.getMaxRetryTime();
+
+        InetAddress address;
+        try {
+            address = InetAddress.getByName(split.getSearchNode());
+        }
+        catch (UnknownHostException e) {
+            throw new PrestoException(ELASTICSEARCH_CONNECTION_ERROR, format("Error connecting to search node (%s:%d)", split.getSearchNode(), split.getPort()), e);
+        }
+        client = new RestHighLevelClient(
+                RestClient.builder(new HttpHost(address, split.getPort(), "http"))
+                        .setMaxRetryTimeoutMillis(Math.toIntExact(requestTimeout.toMillis())));
 
         for (int i = 0; i < columnHandles.size(); i++) {
             jsonPathToIndex.put(columnHandles.get(i).getColumnJsonPath(), i);
@@ -179,10 +190,13 @@ public class ElasticsearchRecordCursor
         checkArgument(expectedTypes.contains(getType(field)), "Field %s has unexpected type %s", field, getType(field));
     }
 
-    @Override
     public void close()
     {
-        builder.close();
+        try {
+            client.close();
+        }catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private SearchResponse getSearchResponse(ElasticsearchQueryBuilder queryBuilder)
@@ -191,9 +205,7 @@ public class ElasticsearchRecordCursor
             return retry()
                     .maxAttempts(maxAttempts)
                     .exponentialBackoff(maxRetryTime)
-                    .run("searchRequest", () -> queryBuilder.buildScrollSearchRequest()
-                            .execute()
-                            .actionGet(requestTimeout.toMillis()));
+                    .run("searchRequest", () -> client.search(queryBuilder.buildScrollSearchRequest()));
         }
         catch (Exception e) {
             throw new RuntimeException(e);
@@ -206,9 +218,7 @@ public class ElasticsearchRecordCursor
             return retry()
                     .maxAttempts(maxAttempts)
                     .exponentialBackoff(maxRetryTime)
-                    .run("scrollRequest", () -> queryBuilder.prepareSearchScroll(scrollId)
-                            .execute()
-                            .actionGet(requestTimeout.toMillis()));
+                    .run("scrollRequest", () -> client.searchScroll(queryBuilder.prepareSearchScroll(scrollId)));
         }
         catch (Exception e) {
             throw new RuntimeException(e);
